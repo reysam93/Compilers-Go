@@ -1,0 +1,1000 @@
+// Echar un ojo a funcones variadicas (variadic)
+// prbar funciones variadicas -> ejemplo en https://golang.org/src/fmt/print.go?s=6273:6320#L214
+
+package fxparser
+
+import (
+	"fmt"
+	"fxlex"
+	"fxsymbols"
+	"io"
+	"strings"
+)
+
+/***********************************************************************
+PROGRAM ::= FUNCS_DECLS eof
+
+FUNCS_DECLARS ::=  FUNCS_DECLAR FUNC_DECLARS | <empty>
+
+FUNC_DECLAR ::= func id '(' PARAMETERS ')' BODY
+
+BODY ::= '{' SENTENCES '}'
+
+PARAMETERS ::= PARAMETER MORE_PARAMETERS | <empty>
+
+MORE_PARAMETERS ::= ',' PARAMETER MORE_PARAMETERS | <empty>
+
+PARAMETER ::= dataType id
+
+SENTENCES ::= LOOP SENTENCES     |
+			IF_STATEMENT SENTENCES |
+			id ID_SENTENCE SENTENCES  |
+			VAR_DECLAR SENTENCES |
+			<empty>
+
+ID_SENTENCE ::= CALL_FUNC | ASIGN
+
+VAR_DECLAR ::= data_type id ';'
+
+IF_STATEMENT ::= if '(' EXPR ')'  '{' BODY '}' ELSE_STM
+
+ELSE_STM ::= else '{' BODY '}' | <empty> 
+
+LOOP ::= iter '(' INITALIZATION ';' EXPR ',' EXPR ')' BODY
+
+INITIALIZATION ::= id ':=' EXPR
+
+CALL_FUNC ::= '(' ARGS ')' ';'
+
+ASIGN ::= '=' EXPR ';'
+
+ARGS ::= EXPR MORE_ARGS | <empty>
+
+MORE_ARGS ::=  ',' EXPR MORE_ARGS | <empty>
+
+________________________________________________________
+Precedence level:
+0. !			Level 0
+1. **			Level 1
+2. * / % &		Level 2
+3. + - ^ |		Level 3
+4. < <= > >=	Level 4
+
+
+EXPR  ::= LEVEL3 INEQ_OP
+
+INEQ_OP ::= INEQ_OPER LEVEL3 INEQ_OP | <empty> 
+
+INEQ_OPER ::= '<' | '<=' | '>' | '>='
+
+LEVEL3 ::= LEVEL2 LEVEL3_OP
+
+LEVEL3_OP ::= LEVEL3_OPER LEVEL2 LEVEL3_OP 	| <empty>
+
+LEVEL3_OPER ::= '+' | '-' | '^' | '|'
+
+LEVEL2 ::= POW LEVEL2_OP
+
+LEVEL2_OP ::= LEVEL2_OPER POW LEVEL2_OP  | <empty>
+
+LEVEL2_OPER ::= '*' | '/' | '%' | '&'
+
+POW ::= NOT_EXP POW_OP
+
+POW_OP ::= '**' NOT_EXP POW_OP | <empty>			
+
+NOT_EXP ::= NOT_OP VAL
+
+NOT_OP ::= '!' NOT_OP | <empty>
+
+VAL ::= id | intLit | boolLit | '(' EXPR ')' | ¿¿¿ '-' '(' EXPR ')' ???
+
+
+***********************************************************************/
+
+// BUILTINS
+var builtins =  map[string]*fxsymbols.Token{
+	"circle": &fxsymbols.Token{Id: fxsymbols.Id, Lex: "circle"},
+	"rect": &fxsymbols.Token{Id: fxsymbols.Id, Lex: "rect"},
+}
+
+var DebugAST bool
+
+const (
+	MaxErrors = 10
+)
+
+// ERRORS
+// IDEAS: un struct con linea, fichero y error que devuelva un error
+var (
+	ErrNoMatch    = fmt.Errorf("Token not found")
+	ErrNoEof      = "EOF expected"
+	ErrNoId       = "Id expected"
+	ErrNoLeftPar  = "Expected '('"
+	ErrNoRightPar = "Expected ')'"
+	ErrNoLeftBra  = "Expected '{'"
+	ErrNoRightBra = "Expected '}'"
+	ErrNoScol     = "Expected ';'"
+	ErrNoComa     = "Expected ','"
+	ErrNoLoopEq   = "Expected ':='"
+	ErrNoParam      = "Parameter expected after ','"
+	ErrNoExpr      = "Expresion expected after"
+	ErrNoVal	=	"Value expected"
+	ErrSyntax     = "Syntax error"
+	ErrNoLevel3	=	"Value or 3 level expresion expected"
+	ErrNoLevel2	=	"Value or 2 level expresion expected"
+	ErrNoPow	=	"Value or pow expresion expected"
+	ErrNoIdSent =	"Function call or asignation expected"
+	ErrUndefinedSym = "Symbol %s is not defined"
+)
+
+type Parser struct {
+	scn   fxlex.Scanner
+	nerrors int
+	symbEnvs *fxsymbols.EnvStack
+	DebugParser bool
+	DebugLex bool
+	level int
+}
+
+func ParserFromReader(file string, r io.Reader) *Parser {
+	text := fxlex.NewText(r)
+	scn := fxlex.NewScanner(file, text)
+	return NewParser(scn)
+}
+
+func NewParser(scn fxlex.Scanner) *Parser {
+	DebugAST = false
+	envs := fxsymbols.NewEnvStack(builtins)
+	return &Parser{scn: scn, DebugParser: false, symbEnvs: envs}
+}
+
+func (parser *Parser) Parse() (*Program, error) {
+	return parser.program()
+}
+
+func (p *Parser) Errorf(s string, v ...interface{}) error {
+	// more things
+	err :=  fmt.Sprintf(s, v...)
+	return fmt.Errorf("%s:%d: %s", p.scn.File(), p.scn.Line(), err)
+}
+
+func (parser *Parser) DebugEnv(debug bool) {
+	parser.symbEnvs.Debug = debug
+}
+
+func (parser *Parser) trace(tag string) {
+	if parser.DebugParser {
+		tab := strings.Repeat("   ", parser.level)
+		fmt.Printf("%stag: %s\n", tab, tag)
+	}
+	parser.level++
+}
+
+func (parser *Parser) traceToken(t fxsymbols.Token) {
+	if parser.DebugParser {
+		tab := strings.Repeat("   ", parser.level)
+		fmt.Printf("%stoken: %s\n", tab, t)
+	}
+}
+
+func (parser *Parser) untrace() {
+	parser.level--
+}
+
+func (parser *Parser) match(id fxsymbols.TokenId) (fxsymbols.Token, error, bool) {
+	token, err := parser.scn.Peek()
+	if err != nil {
+		return fxsymbols.Token{}, err, false
+	}
+	if token.Id != id {
+		return fxsymbols.Token{}, nil, false
+	}
+	token, err = parser.scn.Scan()
+	if parser.DebugLex {
+		fmt.Printf("token: %s\n", token)
+		//parser.traceToken(token)
+	}
+	return token, nil, true
+}
+
+// PROGRAM ::= FUNCS_DECLS eof
+func (parser *Parser) program() (*Program, error) {
+	parser.trace("PROGRAM")
+	defer parser.untrace()
+	parser.symbEnvs.PushEnv()
+	defer parser.symbEnvs.PopEnv()
+	funcs, err := parser.funcsDeclars()
+	if err != nil {
+		return nil, err
+	}
+	if _, _, found := parser.match(fxsymbols.EOF); !found {
+		return nil, parser.Errorf(ErrNoEof)
+	}
+	return NewProgram(funcs), nil
+}
+
+// Programs without any function are currently allowed
+// It will be checked later if they have main or not
+// FUNCS_DECLARS ::=  FUNC_DECLAR FUNCS_DECLARS | <empty>
+func (parser *Parser) funcsDeclars() ([]*Function, error) {
+	parser.trace("FUNCS DECLARS")
+	function, err := parser.funcDeclar()
+	// Empty, is not an error
+	if err == ErrNoMatch {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	funcs, err := parser.funcsDeclars()
+	if err != nil {
+		return nil, err
+	}
+	return append([]*Function{function}, funcs...), nil
+}
+
+//FUNC_DECLAR ::= Func Id '(' PARAMETERS ')' BODY
+func (parser *Parser) funcDeclar() (*Function, error) {
+	parser.trace("FUNC_DECLAR")
+	defer parser.untrace()
+	_, err, found := parser.match(fxsymbols.Func)
+	if err != nil {
+		return nil, err
+		//return ErrSyntax
+	}
+	if !found {
+		return nil, ErrNoMatch
+	}
+	token, _, found := parser.match(fxsymbols.Id)
+	if !found {
+		return nil, parser.Errorf(ErrNoId)
+	}
+	if parser.symbEnvs.GetSymb(token.Lex) != nil {
+		return nil, fxsymbols.ErrFuncExists
+	}
+	parser.symbEnvs.PutFunction(token)
+	parser.symbEnvs.PushEnv()
+	defer parser.symbEnvs.PopEnv()
+	_, _, found = parser.match(fxsymbols.LeftPar)
+	if !found {
+		return nil, parser.Errorf(ErrNoLeftPar)
+	}
+	params, err := parser.parameters()
+	if err != nil {
+		return nil, err
+	}
+	_, _, found = parser.match(fxsymbols.RightPar)
+	if !found {
+		return nil, parser.Errorf(ErrNoRightPar)
+	}
+	body, err := parser.body()
+	if err != nil {
+		return nil, err
+	}
+	return NewFunc(token.Lex, params, body), nil
+}
+
+// PARAMETERS ::= PARAMETER MORE_PARAMS | <empty>
+func (parser *Parser) parameters() ([]*Declaration, error) {
+	parser.trace("PARAMETERS")
+	defer parser.untrace()
+	param, err := parser.parameter()
+	// empty, not an error
+	if err == ErrNoMatch {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	moreParams, err := parser.moreParams()
+	if err != nil {
+		return nil, err
+	}
+	params := []*Declaration{param}
+	if moreParams != nil {
+		params = append(params, moreParams...)
+	}
+	return params, nil
+}
+
+// PARAMETER ::= dataType id
+func (parser *Parser) parameter() (*Declaration, error) {
+	parser.trace("PARAMETER")
+	defer parser.untrace()
+	dataTypeTok, err, found := parser.match(fxsymbols.DataType)
+	if err != nil {
+		// return ErrSyntax
+		return nil, err
+	}
+	if !found {
+		return nil, ErrNoMatch
+	}
+	dataIdTok, _, found := parser.match(fxsymbols.Id)
+	if !found {
+		return nil, parser.Errorf(ErrNoId)
+	}
+	if parser.symbEnvs.GetSymb(dataIdTok.Lex) != nil {
+		return nil, fxsymbols.ErrVarExists
+	}
+	parser.symbEnvs.PutVar(dataIdTok)
+	return NewDeclaration(dataIdTok.Lex, fxlex.DataTypeConst(dataTypeTok.Val)), nil
+}
+
+// MORE_PARAMS ::= ',' PARAM MORE_PARAMS | <empty>
+func (parser *Parser) moreParams() ([]*Declaration, error) {
+	parser.trace("MORE_PARAMS")
+	defer parser.untrace()
+	_, _, found := parser.match(fxsymbols.Coma)
+
+	if !found {
+		return nil, nil
+	}
+	param, err := parser.parameter()
+	if err != nil {
+		if err == ErrNoMatch {
+			err = parser.Errorf(ErrNoParam)
+		}
+		return nil, err
+	}
+	params, err := parser.moreParams()
+	if err != nil {
+		return nil, err
+	}
+	return append([]*Declaration{param}, params...), nil
+}
+
+// BODY ::= '{' SENTENCES '}'
+func (parser *Parser) body() ([]*Sentence, error) {
+	parser.trace("BODY")
+	defer parser.untrace()
+	if _, _, found := parser.match(fxsymbols.LeftBra); !found {
+		return nil, parser.Errorf(ErrNoLeftBra)
+	}
+	body, err := parser.sentences()
+	if err != nil {
+		return nil, err
+	}
+	if _, _, found := parser.match(fxsymbols.RightBra); !found {
+		return nil, parser.Errorf(ErrNoRightBra)
+	}
+	return body, nil
+}
+
+// SENTENCES ::= LOOP SENTENCES | id ID_SENTENCE SENTENCES | VAR_DECLAR SENTENCES |
+//					 IF_STATEMENT  SENTENCES | <empty>
+func (parser *Parser) sentences() ([]*Sentence, error) {
+	parser.trace("SENTENCES ")
+	defer parser.untrace()
+
+	var sentence *Sentence
+	loop, err := parser.loop()
+	if err == nil {
+		sentence = NewLoopSentence(loop)
+	} else {
+		if err != ErrNoMatch {
+			return nil, err
+		}
+	}
+	if sentence == nil {
+		id, err, found := parser.match(fxsymbols.Id)
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			if parser.symbEnvs.GetSymb(id.Lex) == nil {
+				return nil, parser.Errorf(ErrUndefinedSym, id.Lex)
+			}
+			id_sent, err := parser.id_sentence(id.Lex)
+			if err != nil {
+				return nil, err
+			}
+			sentence = id_sent
+		}
+	}
+	if sentence == nil {
+		if_stm, err := parser.if_statement()
+		if err == nil {
+			sentence = NewIfSentence(if_stm)
+		} else {
+			if err != ErrNoMatch {
+				return nil, err
+			}
+		}
+	}
+	if sentence == nil {
+		declar, err := parser.var_declar()
+		if err == nil {
+			sentence = NewDeclSentence(declar)
+		} else {
+			if err != ErrNoMatch {
+				return nil, err
+			}
+		}
+	}
+	if sentence == nil {
+		return nil, nil
+	}
+	sentences, err := parser.sentences()
+	if err != nil {
+		return nil, err
+	}
+	fmt.Println(sentence)
+	sentences = append([]*Sentence{sentence}, sentences...)
+	return sentences, nil
+}
+
+// LOOP ::= iter '(' INITALIZATION ';' EXPR ',' EXPR ')' BODY
+func (parser *Parser) loop() (*Loop, error) {
+	parser.trace("LOOP")
+	defer parser.untrace()
+	_, err, found := parser.match(fxsymbols.Iter)
+	if err != nil {
+		return nil, err
+		// return ErrSyntax
+	}
+	if !found {
+		return nil, ErrNoMatch
+	}
+	parser.symbEnvs.PushEnv()
+	defer parser.symbEnvs.PopEnv()
+	if _, _, found = parser.match(fxsymbols.LeftPar); !found {
+		return nil, parser.Errorf(ErrNoLeftPar)
+	}
+	control, err := parser.initialization()
+	if err != nil {
+		return nil, err
+	}
+	if _, _, found = parser.match(fxsymbols.Scol); !found {
+		return nil, parser.Errorf(ErrNoScol)
+	}
+	endCond, err := parser.expr()
+	if err != nil {
+		if err == ErrNoMatch {
+			err = parser.Errorf(ErrNoExpr)
+		}
+		return nil, err
+	}
+	if _, _, found = parser.match(fxsymbols.Coma); !found {
+		return nil, parser.Errorf(ErrNoComa)
+	}
+	incr, err := parser.expr()
+	if err != nil {
+		if err == ErrNoMatch {
+			err = parser.Errorf(ErrNoExpr)
+		}
+		return nil, err
+	}
+	if _, _, found = parser.match(fxsymbols.RightPar); !found {
+		return nil, parser.Errorf(ErrNoRightPar)
+	}
+	body, err := parser.body()
+	if err != nil {
+		return nil, err
+	}
+	return NewLoop(control, endCond, incr, body), nil
+}
+
+// INITIALIZATION ::= id ':=' EXPR
+func (parser *Parser) initialization() (*Asignation, error) {
+	parser.trace("INITIALIZATION")
+	defer parser.untrace()
+	idTok, _, found := parser.match(fxsymbols.Id)
+	if !found {
+		return nil, parser.Errorf(ErrNoId)
+	}
+	if parser.symbEnvs.GetSymb(idTok.Lex) == nil {
+		return nil, parser.Errorf(ErrUndefinedSym, idTok.Lex)
+	}
+	if _, _, found := parser.match(fxsymbols.LoopEq); !found {
+		return nil, parser.Errorf(ErrNoLoopEq)
+	}
+	expr, err := parser.expr()
+	if err != nil {
+		if err == ErrNoMatch {
+			err = parser.Errorf(ErrNoExpr)
+		}
+		return nil, err
+	}
+	asig := NewAsign(idTok.Lex, expr)
+	return asig, nil
+}
+
+// IF_STATEMENT ::= if '(' EXPR ')' BODY ELSE_STM
+func (parser *Parser) if_statement() (*IfStatement, error) {
+	parser.trace("IF_STATEMENT")
+	defer parser.untrace()
+
+	_, err, found := parser.match(fxsymbols.If)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, ErrNoMatch
+	}
+	_, _, found = parser.match(fxsymbols.LeftPar)
+	if !found {
+		return nil, parser.Errorf(ErrNoLeftPar)
+	}
+	expr, err := parser.expr()
+	if err == ErrNoMatch {
+		return nil, parser.Errorf(ErrNoExpr)
+	}
+	if err != nil {
+		return nil, err
+	}
+	_, _, found = parser.match(fxsymbols.RightPar)
+	if !found {
+		return nil, parser.Errorf(ErrNoRightPar)
+	}
+	parser.symbEnvs.PushEnv()
+	body, err := parser.body()
+	if err != nil {
+		parser.symbEnvs.PopEnv()
+		return nil, err
+	}
+	parser.symbEnvs.PopEnv()
+	else_stm, err := parser.else_stm()
+	if err != nil {
+		return nil, err
+	}
+	return NewIfStatement(expr, body, else_stm), nil
+}
+
+//ELSE_STM ::= else BODY | <empty> 
+func (parser *Parser) else_stm() ([]*Sentence, error) {
+	parser.trace("ELSE_STM")
+	defer parser.untrace()
+
+	_, err, found := parser.match(fxsymbols.Else)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, nil
+	}
+	parser.symbEnvs.PushEnv()
+	defer parser.symbEnvs.PopEnv()
+	body, err := parser.body()
+	if err != nil {
+		return nil, err
+	}
+	return body, nil
+}
+
+// ID_SENTENCE ::= CALL_FUNC | ASIGN
+func (parser *Parser) id_sentence(id string) (*Sentence, error) {
+	parser.trace("ID_SENTENCE")
+	defer parser.untrace()
+	
+	call_func, err := parser.callFunc(id)
+	if err == nil {
+		return NewFuncCallSentence(call_func), nil
+	}
+	if err != ErrNoMatch {
+		return nil, err
+	}
+	asign, err := parser.asign(id)
+	if err == ErrNoMatch {
+		return nil, parser.Errorf(ErrNoIdSent)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return NewAsginSentence(asign), nil
+}
+
+// CALL_FUNC ::= '(' ARGS ')' ';'
+func (parser *Parser) callFunc(id string) (*FunctionCall, error) {
+	parser.trace("CALL_FUNC")
+	defer parser.untrace()
+	_, err, found := parser.match(fxsymbols.LeftPar)
+	if err != nil {
+		// return ErrSyntax
+		return nil, err
+	}
+	if !found {
+		return nil, ErrNoMatch
+	}
+	args, err := parser.args()
+	if err != nil {
+		return nil, err
+	}
+	if _, _, found = parser.match(fxsymbols.RightPar); !found {
+		return nil, parser.Errorf(ErrNoRightPar)
+	}
+	if _, _, found = parser.match(fxsymbols.Scol); !found {
+		return nil, parser.Errorf(ErrNoScol)
+	}
+	return NewFuncCall(id, args), nil
+}
+
+// ASIGN ::= '=' EXPR ';'
+func (parser *Parser) asign(id string) (*Asignation, error) {
+	parser.trace("ASIGN")
+	defer parser.untrace()
+	_, err, found := parser.match(fxsymbols.Eq)
+	if err != nil {
+		// return ErrSyntax
+		return nil, err
+	}
+	if !found {
+		return nil, ErrNoMatch
+	}
+	expr, err := parser.expr()
+	if err == ErrNoMatch {
+		return nil, parser.Errorf(ErrNoExpr)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if _, _, found = parser.match(fxsymbols.Scol); !found {
+		return nil, parser.Errorf(ErrNoScol)
+	}
+	return NewAsign(id, expr), nil
+}
+
+// VAR_DECLAR ::= data_type id ';'
+func (parser *Parser) var_declar() (*Declaration, error) {
+	parser.trace("VAR_DECLAR")
+	defer parser.untrace()
+	dataType, err, found := parser.match(fxsymbols.DataType)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, ErrNoMatch
+	}
+	id, err, found := parser.match(fxsymbols.Id)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, parser.Errorf(ErrNoId)
+	}
+	_, err, found = parser.match(fxsymbols.Scol)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, parser.Errorf(ErrNoScol)
+	}
+	if parser.symbEnvs.GetSymb(id.Lex) != nil {
+		return nil, fxsymbols.ErrVarExists
+	}
+	parser.symbEnvs.PutVar(id)
+	return NewDeclaration(id.Lex, fxlex.DataTypeConst(dataType.Val)), nil
+}
+
+// ARGS ::= EXPR MORE_ARGS | <empty>
+func (parser *Parser) args() ([]*Expr, error) {
+	parser.trace("ARGS")
+	defer parser.untrace()
+	expr, err := parser.expr()
+	if err == ErrNoMatch {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	moreExpr, err := parser.moreArgs()
+	if err == ErrNoMatch {
+		return []*Expr{expr}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	exprs := append([]*Expr{expr}, moreExpr...)
+	return exprs, nil
+}
+
+// MORE_ARGS ::=  ',' EXPR MORE_ARGS | <empty>
+func (parser *Parser) moreArgs() ([]*Expr, error) {
+	parser.trace("MORE_ARGS")
+	defer parser.untrace()
+	if _, _, found := parser.match(fxsymbols.Coma); !found {
+		return nil, nil
+	}
+	expr, err := parser.expr()
+	if err != nil {
+		if err == ErrNoMatch {
+			err = parser.Errorf(ErrNoExpr)
+		}
+		return nil, err
+	}
+	exprs, err := parser.moreArgs()
+	if err != nil {
+		return nil, err
+	}
+	return append([]*Expr{expr}, exprs...), nil
+}
+
+func (parser *Parser) findOperand(ops []fxsymbols.TokenId) (fxsymbols.Token, error) {
+	for _, op := range ops {
+		token, err, found := parser.match(op)
+		if err != nil {
+			return fxsymbols.Token{}, err
+		}
+		if found {
+			return token, nil
+		}
+	}
+	return fxsymbols.Token{}, nil
+}
+
+// EXPR  ::= LEVEL3 INEQ_OP
+func (parser *Parser) expr() (*Expr, error) {
+	parser.trace("EXPR")
+	defer parser.untrace()
+
+	level3, err := parser.level3()
+	if err != nil {
+		return nil, err
+	}
+	ineq_op, op, err := parser.ineq_op()
+	if err != nil {
+		return nil, err
+	}
+	return NewExpr(op, level3, ineq_op), nil
+}
+
+//INEQ_OP ::= INEQ_OPER LEVEL3 INEQ_OP | <empty>
+func (parser *Parser) ineq_op() (*SubExpr, fxsymbols.TokenId, error) {
+	parser.trace("INEQ_OP")
+	defer parser.untrace()
+
+	//INEQ_OPER ::= '<' | '<=' | '>' | '>='
+	ineq_ops := []fxsymbols.TokenId{fxsymbols.Less, fxsymbols.LessEq, fxsymbols.Big, fxsymbols.BigEq}
+	op, err := parser.findOperand(ineq_ops)
+	if err != nil {
+		return nil, fxsymbols.None, err
+	}
+	if op.Id == fxsymbols.None {
+		return nil, fxsymbols.None, nil
+	}
+	level3, err := parser.level3()
+	if err == ErrNoMatch {
+		err = parser.Errorf(ErrNoVal)
+	}
+	if err != nil {
+		return nil, fxsymbols.None, err
+	}
+	ineq_op, op2, err := parser.ineq_op()
+	if err != nil {
+		return nil, fxsymbols.None, err
+	}
+	if ineq_op == nil {
+		return level3, op.Id, nil
+	}
+	return NewExprSubExpr(NewExpr(op2, level3, ineq_op)), op.Id, nil
+}
+
+//LEVEL3 ::= LEVEL2 LEVEL3_OP
+func (parser *Parser) level3() (*SubExpr, error) {
+	parser.trace("LEVEL3")
+	defer parser.untrace()
+
+	level2, err := parser.level2()
+	if err != nil {
+		return nil, err
+	}
+	level3_op, op, err := parser.level3_op()
+	if err != nil {
+		return nil, err
+	}
+	if level3_op == nil {
+		return level2, nil
+	}
+	return NewExprSubExpr(NewExpr(op, level2, level3_op)), nil
+}
+
+//LEVEL3_OP ::= LEVEL3_OPER LEVEL2 LEVEL3_OP | <empty>
+func (parser *Parser) level3_op() (*SubExpr, fxsymbols.TokenId, error) {
+	parser.trace("LEVEL3_OP")
+	defer parser.untrace()
+
+	//LEVEL3_OPER ::= '+' | '-' | '^' | '|'
+	level3_ops := []fxsymbols.TokenId{fxsymbols.Add, fxsymbols.Subs, fxsymbols.Xor, fxsymbols.Or}
+	op, err := parser.findOperand(level3_ops)
+	if err != nil {
+		return nil, fxsymbols.None, err
+	}
+	if op.Id == fxsymbols.None {
+		return nil, op.Id, nil
+	}
+	level2, err := parser.level2()
+	if err == ErrNoMatch {
+		err = parser.Errorf(ErrNoVal)
+	}
+	if err != nil {
+		return nil, fxsymbols.None, err
+	}
+	level3_op, op2, err := parser.level3_op()
+	if err != nil {
+		return nil, fxsymbols.None, err
+	}
+	if level3_op == nil {
+		return level2, op.Id, nil
+	}
+	return NewExprSubExpr(NewExpr(op2, level2, level3_op)), op.Id, nil
+}
+
+//LEVEL2 ::= POW LEVEL2_OP
+func (parser *Parser) level2() (*SubExpr, error) {
+	parser.trace("LEVEL2")
+	defer parser.untrace()
+
+	pow, err := parser.pow()
+	if err != nil {
+		return nil, err
+	}
+	level2_op , op, err := parser.level2_op()
+	if err != nil {
+		return nil, err
+	}
+	if level2_op == nil {
+		return pow, nil
+	}
+	return NewExprSubExpr(NewExpr(op, pow, level2_op)), nil
+}
+
+// LEVEL2_OP ::= LEVEL2_OPER POW LEVEL2_OP  | <empty>
+func (parser *Parser) level2_op() (*SubExpr, fxsymbols.TokenId, error) {
+	parser.trace("LEVEL2_OP")
+	defer parser.untrace()
+
+	// LEVEL2_OPER ::= '*' | '/' | '%' | '&'
+	level2_ops := []fxsymbols.TokenId{fxsymbols.Mult, fxsymbols.Div, fxsymbols.Mod, fxsymbols.And}
+	op, err := parser.findOperand(level2_ops)
+	if err != nil {
+		return nil, fxsymbols.None, err
+	}
+	if op.Id == fxsymbols.None {
+		return nil, op.Id, nil
+	}
+	pow, err := parser.pow()
+	if err == ErrNoMatch {
+		err = parser.Errorf(ErrNoVal)
+	}
+	if err != nil {
+		return nil, fxsymbols.None, err
+	}
+	level2_op, op2, err := parser.level2_op()
+	if err != nil {
+		return nil, fxsymbols.None, err 
+	}
+	if level2_op == nil {
+		return pow, op.Id, nil
+	}
+	return NewExprSubExpr(NewExpr(op2, pow, level2_op)), op.Id, nil
+}
+
+// POW ::= NOT_EXP POW_OP
+func (parser *Parser) pow() (*SubExpr, error) {
+	parser.trace("POW")
+	defer parser.untrace()
+
+	not_expr, err := parser.not_expr()
+	if err != nil {
+		return nil, err
+	}
+	pow_op, op, err := parser.pow_op()
+	if err != nil {
+		return nil, err
+	}
+	if pow_op == nil {
+		return not_expr, nil
+	}
+
+	return NewExprSubExpr(NewExpr(op, not_expr, pow_op)), nil
+}
+
+// POW_OP ::= '**' NOT_EXPR POW_OP | <empty>
+func (parser *Parser) pow_op() (*SubExpr, fxsymbols.TokenId, error) {
+	parser.trace("POW_OP")
+	defer parser.untrace()
+
+	op, err, found := parser.match(fxsymbols.Pow)
+	if err != nil {
+		return nil, fxsymbols.None, err
+	}
+	if !found {
+		return nil, fxsymbols.None, nil
+	}
+	not_expr, err := parser.not_expr()
+	if err == ErrNoMatch {
+		err = parser.Errorf(ErrNoVal)
+	}
+	if err != nil {
+		return nil, fxsymbols.None, err
+	}
+	pow_op, op2, err := parser.pow_op()
+	if err != nil {
+		return nil, op2, err
+	}
+	if pow_op == nil {
+		return not_expr, op.Id, nil
+	}
+	return NewExprSubExpr(NewExpr(op2, not_expr, pow_op)), op.Id, nil
+}
+
+// NOT_EXPR ::= NOT_OP VAL
+func (parser *Parser) not_expr() (*SubExpr, error) {
+	parser.trace("NOT_EXPR")
+	defer parser.untrace()
+
+	op, err := parser.not_op()
+	if err != nil {
+		return nil, err
+	}
+	val, err := parser.val()
+	if op != fxsymbols.None && err == ErrNoMatch {
+		return nil, parser.Errorf(ErrNoVal)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if op == fxsymbols.None {
+		return val, nil
+	}
+	return NewExprSubExpr(NewExpr(op, val, nil)), nil
+}
+
+// NOT_OP ::= '!' NOT_OP | <empty>
+func (parser *Parser) not_op() (fxsymbols.TokenId, error) {
+	parser.trace("NOT_OP")
+	defer parser.untrace()
+
+	_, err, found := parser.match(fxsymbols.Not)
+	if err != nil {
+		return fxsymbols.None, err
+	}
+	if !found {
+		return fxsymbols.None, nil
+	}
+	op, err := parser.not_op()
+	if err != nil {
+		return op, err 
+	}
+	if op == fxsymbols.None {
+		return fxsymbols.Not, nil
+	} else {
+		return fxsymbols.None, nil
+	}
+}
+
+// VAL ::= id | intLit | boolLit | '(' EXPR ')'
+func (parser *Parser) val() (*SubExpr, error) {
+	parser.trace("VAL")
+	defer parser.untrace()
+
+	values := []fxsymbols.TokenId{fxsymbols.Id, fxsymbols.IntLit, fxsymbols.BoolLit, fxsymbols.LeftPar}
+	val, err := parser.findOperand(values)
+
+	if err != nil {
+		return nil, err
+	}
+	if val.Id == fxsymbols.None {
+		return nil, ErrNoMatch
+	}
+	if val.Id == fxsymbols.Id {
+		if parser.symbEnvs.GetSymb(val.Lex) == nil {
+			return nil, parser.Errorf(ErrUndefinedSym, val.Lex)
+		}
+	}
+	if val.Id == fxsymbols.LeftPar {
+		expr, err := parser.expr()
+		if err != nil {
+			return nil, err
+		}
+		_, err, found := parser.match(fxsymbols.RightPar)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			return nil, parser.Errorf(ErrNoRightPar)
+		}
+		return NewExprSubExpr(expr), nil
+	}
+	return NewValSubExpr(&val), nil
+}
